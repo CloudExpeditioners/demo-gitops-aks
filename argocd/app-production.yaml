@@ -6,7 +6,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/TU-USUARIO/demo-gitops-aks
+    repoURL: https://github.com/CloudExpeditioners/demo-gitops-aks
     targetRevision: main
     path: apps/demo-app/overlays/production
   destination:
