@@ -1,0 +1,56 @@
+name: CI - Validate and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+
+  validate-yaml:
+    name: Validate YAML Manifests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Validate YAML syntax
+        run: |
+          kubectl apply --dry-run=client -f apps/demo-app/base/deployment.yaml
+          kubectl apply --dry-run=client -f apps/demo-app/base/service.yaml
+          echo "✅ YAML válido"
+
+  validate-kustomize:
+    name: Validate Kustomize Build
+    runs-on: ubuntu-latest
+    needs: validate-yaml
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Build kustomize overlay
+        run: |
+          kubectl kustomize apps/demo-app/overlays/production
+          echo "✅ Kustomize build exitoso"
+
+  notify-argocd:
+    name: Notify Argo CD - Sync Ready
+    runs-on: ubuntu-latest
+    needs: [validate-yaml, validate-kustomize]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Notify sync
+        run: |
+          echo "✅ Pipeline completado - Argo CD detectará el cambio en ~3 minutos"
+          echo "📦 Commit: ${{ github.sha }}"
+          echo "👤 Author: ${{ github.actor }}"
+          echo "📝 Message: ${{ github.event.head_commit.message }}"
