@@ -1,4 +1,4 @@
-name: CI - Validate and Deploy
+name: CI/CD - GitOps Pipeline Production
 
 on:
   push:
@@ -11,23 +11,23 @@ on:
 jobs:
 
   validate-yaml:
-    name: Validate YAML Manifests
+    name: "🔍 Validate YAML"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v3
+      - name: Install yamllint
+        run: pip install yamllint
 
       - name: Validate YAML syntax
         run: |
-          kubectl apply --dry-run=client -f apps/demo-app/base/deployment.yaml
-          kubectl apply --dry-run=client -f apps/demo-app/base/service.yaml
-          echo "✅ YAML válido"
+          yamllint apps/demo-app/base/deployment.yaml
+          yamllint apps/demo-app/base/service.yaml
+          echo "✅ YAML sintaxis válida"
 
   validate-kustomize:
-    name: Validate Kustomize Build
+    name: "📦 Validate Kustomize"
     runs-on: ubuntu-latest
     needs: validate-yaml
     steps:
@@ -42,15 +42,122 @@ jobs:
           kubectl kustomize apps/demo-app/overlays/production
           echo "✅ Kustomize build exitoso"
 
-  notify-argocd:
-    name: Notify Argo CD - Sync Ready
+  validate-against-cluster:
+    name: "☁️ Validate Against AKS"
     runs-on: ubuntu-latest
-    needs: [validate-yaml, validate-kustomize]
+    needs: validate-kustomize
     if: github.ref == 'refs/heads/main'
     steps:
-      - name: Notify sync
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ secrets.RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Validate against real cluster
         run: |
-          echo "✅ Pipeline completado - Argo CD detectará el cambio en ~3 minutos"
-          echo "📦 Commit: ${{ github.sha }}"
-          echo "👤 Author: ${{ github.actor }}"
-          echo "📝 Message: ${{ github.event.head_commit.message }}"
+          kubectl kustomize apps/demo-app/overlays/production | \
+          kubectl apply --dry-run=server -f -
+          echo "✅ Validación contra clúster real exitosa"
+
+  check-argocd-sync:
+    name: "🔄 Check Argo CD Sync Status"
+    runs-on: ubuntu-latest
+    needs: validate-against-cluster
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ secrets.RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Wait for Argo CD to sync
+        run: |
+          echo "⏳ Esperando que Argo CD detecte el cambio..."
+          sleep 30
+
+          STATUS=$(kubectl get application demo-app-prod \
+            -n argocd \
+            -o jsonpath='{.status.sync.status}')
+
+          echo "📊 Sync Status: $STATUS"
+
+          if [ "$STATUS" = "Synced" ]; then
+            echo "✅ Argo CD sincronizado correctamente"
+          else
+            echo "⚠️ Argo CD aún sincronizando - status: $STATUS"
+          fi
+
+  check-health:
+    name: "❤️ Check App Health"
+    runs-on: ubuntu-latest
+    needs: check-argocd-sync
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ secrets.RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Check deployment health
+        run: |
+          kubectl rollout status deployment/demo-app \
+            -n production \
+            --timeout=120s
+
+          READY=$(kubectl get deployment demo-app \
+            -n production \
+            -o jsonpath='{.status.readyReplicas}')
+
+          echo "📊 Pods ready: $READY/3"
+
+          if [ "$READY" = "3" ]; then
+            echo "✅ App saludable - 3/3 pods running"
+          else
+            echo "❌ App degradada - solo $READY pods running"
+            exit 1
+          fi
+
+  rollback:
+    name: "⏪ Rollback if Failed"
+    runs-on: ubuntu-latest
+    needs: check-health
+    if: failure()
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ secrets.RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Rollback deployment
+        run: |
+          echo "🚨 Deploy fallido - ejecutando rollback..."
+          kubectl rollout undo deployment/demo-app -n production
+          kubectl rollout status deployment/demo-app -n production
+          echo "✅ Rollback completado"
