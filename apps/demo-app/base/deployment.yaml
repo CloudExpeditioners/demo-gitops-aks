@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: demo-app
-          image: nginxdemos/hello:0.4
+          image: acrgitopsdemo.azurecr.io/demo-app:6
           ports:
             - containerPort: 80
           resources:
