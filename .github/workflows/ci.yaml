@@ -1,4 +1,4 @@
-name: CI/CD - GitOps Pipeline Production
+name: CI/CD - GitOps Full Pipeline
 
 on:
   push:
@@ -8,10 +8,14 @@ on:
     branches:
       - main
 
+env:
+  IMAGE_NAME: demo-app
+  IMAGE_TAG: ${{ github.run_number }}
+
 jobs:
 
   validate-yaml:
-    name: "🔍 Validate YAML"
+    name: "🔍 Validate YAML Manifests"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -24,29 +28,75 @@ jobs:
         run: |
           yamllint apps/demo-app/base/deployment.yaml
           yamllint apps/demo-app/base/service.yaml
-          echo "✅ YAML sintaxis válida"
+          echo "✅ YAML válido"
 
-  validate-kustomize:
-    name: "📦 Validate Kustomize"
+  build-and-push:
+    name: "🐳 Build & Push Image to ACR"
     runs-on: ubuntu-latest
     needs: validate-yaml
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      image_tag: ${{ env.IMAGE_TAG }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v3
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Build kustomize overlay
+      - name: Login to ACR
         run: |
-          kubectl kustomize apps/demo-app/overlays/production
-          echo "✅ Kustomize build exitoso"
+          az acr login --name ${{ secrets.ACR_NAME }}
+
+      - name: Build and push image
+        run: |
+          docker build \
+            -t ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            -t ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest \
+            ./app
+
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+
+          echo "✅ Imagen pusheada: ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+
+  update-manifest:
+    name: "📝 Update Kubernetes Manifest"
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update image in deployment.yaml
+        run: |
+          echo "📝 Actualizando imagen en manifest..."
+          echo "Nueva imagen: ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+
+          sed -i "s|image:.*|image: ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" \
+            apps/demo-app/base/deployment.yaml
+
+          echo "✅ Manifest actualizado"
+          cat apps/demo-app/base/deployment.yaml | grep image
+
+      - name: Commit and push manifest update
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add apps/demo-app/base/deployment.yaml
+          git commit -m "ci: update image to ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} [skip ci]"
+          git push
+          echo "✅ Manifest actualizado en Git"
 
   validate-against-cluster:
     name: "☁️ Validate Against AKS"
     runs-on: ubuntu-latest
-    needs: validate-kustomize
-    if: github.ref == 'refs/heads/main'
+    needs: update-manifest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -66,10 +116,10 @@ jobs:
         run: |
           kubectl kustomize apps/demo-app/overlays/production | \
           kubectl apply --dry-run=server -f -
-          echo "✅ Validación contra clúster real exitosa"
+          echo "✅ Validación contra clúster exitosa"
 
   check-argocd-sync:
-    name: "🔄 Check Argo CD Sync Status"
+    name: "🔄 Check Argo CD Sync"
     runs-on: ubuntu-latest
     needs: validate-against-cluster
     if: github.ref == 'refs/heads/main'
@@ -85,22 +135,26 @@ jobs:
           resource-group: ${{ secrets.RESOURCE_GROUP }}
           cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
 
-      - name: Wait for Argo CD to sync
+      - name: Wait for Argo CD sync
         run: |
-          echo "⏳ Esperando que Argo CD detecte el cambio..."
-          sleep 30
+          echo "⏳ Esperando que Argo CD detecte el cambio en Git..."
+          sleep 60
 
-          STATUS=$(kubectl get application demo-app-prod \
-            -n argocd \
-            -o jsonpath='{.status.sync.status}')
+          for i in {1..5}; do
+            STATUS=$(kubectl get application demo-app-prod \
+              -n argocd \
+              -o jsonpath='{.status.sync.status}')
 
-          echo "📊 Sync Status: $STATUS"
+            echo "Intento $i — Sync Status: $STATUS"
 
-          if [ "$STATUS" = "Synced" ]; then
-            echo "✅ Argo CD sincronizado correctamente"
-          else
-            echo "⚠️ Argo CD aún sincronizando - status: $STATUS"
-          fi
+            if [ "$STATUS" = "Synced" ]; then
+              echo "✅ Argo CD sincronizado"
+              break
+            fi
+
+            echo "⏳ Esperando... intento $i de 5"
+            sleep 30
+          done
 
   check-health:
     name: "❤️ Check App Health"
@@ -129,12 +183,16 @@ jobs:
             -n production \
             -o jsonpath='{.status.readyReplicas}')
 
-          echo "📊 Pods ready: $READY/3"
+          DESIRED=$(kubectl get deployment demo-app \
+            -n production \
+            -o jsonpath='{.spec.replicas}')
 
-          if [ "$READY" = "3" ]; then
-            echo "✅ App saludable - 3/3 pods running"
+          echo "📊 Pods ready: $READY/$DESIRED"
+
+          if [ "$READY" = "$DESIRED" ]; then
+            echo "✅ App saludable - $READY/$DESIRED pods running"
           else
-            echo "❌ App degradada - solo $READY pods running"
+            echo "❌ App degradada - solo $READY/$DESIRED pods running"
             exit 1
           fi
 
@@ -157,7 +215,7 @@ jobs:
 
       - name: Rollback deployment
         run: |
-          echo "🚨 Deploy fallido - ejecutando rollback..."
+          echo "🚨 Deploy fallido — ejecutando rollback..."
           kubectl rollout undo deployment/demo-app -n production
           kubectl rollout status deployment/demo-app -n production
           echo "✅ Rollback completado"
