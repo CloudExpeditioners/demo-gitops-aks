@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: demo-app
-          image: acrgitopsdemo.azurecr.io/demo-app:9
+          image: acrgitopsdemo.azurecr.io/demo-app:10
           ports:
             - containerPort: 80
           resources:
